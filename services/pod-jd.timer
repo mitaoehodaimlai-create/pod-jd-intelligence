@@ -1,0 +1,28 @@
+# systemd timer — triggers pod-jd.service twice daily
+#
+# Install alongside pod-jd.service then:
+#   sudo cp pod-jd.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pod-jd.timer
+#
+# Check status:
+#   systemctl list-timers pod-jd.timer
+#   journalctl -u pod-jd.service -f
+
+[Unit]
+Description=POD-JD Intelligence timer — run twice daily
+Requires=pod-jd.service
+
+[Timer]
+# 9 AM and 3 PM every day
+OnCalendar=*-*-* 09:00:00
+OnCalendar=*-*-* 15:00:00
+
+# Run immediately if a scheduled run was missed (e.g. server was down)
+Persistent=true
+
+# Randomize start within 5 minutes to avoid thundering herd if multiple instances
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

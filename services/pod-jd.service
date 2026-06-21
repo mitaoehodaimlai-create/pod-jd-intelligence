@@ -1,0 +1,37 @@
+# systemd one-shot service — runs pipeline once per invocation
+# Pair with pod-jd.timer to run on a schedule.
+#
+# Install:
+#   sudo cp pod-jd.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable pod-jd.timer
+#   sudo systemctl start  pod-jd.timer
+
+[Unit]
+Description=POD-JD Intelligence — process placement emails
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pod-jd
+Group=pod-jd
+WorkingDirectory=/opt/pod-jd-intelligence
+
+# Virtualenv python (adjust path if using system python)
+ExecStart=/opt/pod-jd-intelligence/venv/bin/python main.py run
+
+EnvironmentFile=/opt/pod-jd-intelligence/.env
+
+# Harden the service
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/pod-jd-intelligence/output
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pod-jd
+
+[Install]
+WantedBy=multi-user.target

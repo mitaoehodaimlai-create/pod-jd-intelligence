@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pod-jd-intelligence": {
+      "command": "python",
+      "args": ["/Users/dipteesomeshwarghusse/Documents/code/pod_jd_intelligence/mcp_server.py"],
+      "env": {
+        "PYTHONPATH": "/Users/dipteesomeshwarghusse/Documents/code/pod_jd_intelligence"
+      }
+    }
+  }
+}

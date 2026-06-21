@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd agent — runs pipeline twice daily.
+
+  Install (user-level agent):
+    cp com.mitaoe.pod-jd.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.mitaoe.pod-jd.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.mitaoe.pod-jd.plist
+    rm ~/Library/LaunchAgents/com.mitaoe.pod-jd.plist
+
+  View logs:
+    tail -f /tmp/pod-jd.out.log
+    tail -f /tmp/pod-jd.err.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mitaoe.pod-jd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Adjust to match your Python installation -->
+        <string>/usr/local/bin/python3</string>
+        <string>/Users/dipteesomeshwarghusse/Documents/code/pod_jd_intelligence/main.py</string>
+        <string>run</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/dipteesomeshwarghusse/Documents/code/pod_jd_intelligence</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Loaded from .env by python-dotenv; keep path correct -->
+        <key>DOTENV_PATH</key>
+        <string>/Users/dipteesomeshwarghusse/Documents/code/pod_jd_intelligence/.env</string>
+    </dict>
+
+    <!-- Run at 9:00 AM and 3:00 PM daily -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>   <integer>9</integer>
+            <key>Minute</key> <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>   <integer>15</integer>
+            <key>Minute</key> <integer>0</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/pod-jd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/pod-jd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

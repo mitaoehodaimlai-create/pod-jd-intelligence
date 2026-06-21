@@ -1,0 +1,48 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+
+# Environment / secrets
+.env
+*.env
+*.pem
+*.key
+
+# Output (mount as volume instead)
+output/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Docs / diagrams
+*.html
+*.md
+!README.md
+
+# Tests
+tests/
+*.test.py
+pytest_cache/
+.coverage
+
+# Services (not needed inside container)
+services/
