@@ -58,6 +58,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from rich.console import Console
 from rich.table import Table
@@ -76,17 +77,258 @@ import config
 console = Console()
 
 
-# ── RAG STORE (lazy import — works even if chromadb not installed) ─────────────
-# RAG = Retrieval-Augmented Generation:
-#   - Stores each parsed JD as a semantic vector in ChromaDB
-#   - Before agent calls, retrieves similar past JDs as context
-#   - Agents produce better recommendations with this historical context
+# ─────────────────────────────────────────────────────────────────────────────
+# RAG STORE — Retrieval-Augmented Generation (inline, no separate rag/ package)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# RAG in one line: "give the LLM relevant past JDs so it generates better output"
+#
+# HOW IT WORKS:
+#   R — Retrieve : past JDs stored as 384-number vectors in ChromaDB on disk
+#   A — Augment  : top-3 similar JDs appended to the agent's LLM prompt
+#   G — Generate : LLM sees current JD + history → richer recommendations
+#
+# WITHOUT RAG: AI sees only THIS JD → standard recommendations
+# WITH RAG:    AI spots patterns like "Python in 90% of similar JDs → top priority"
+#              or "DSA gap appeared 4 times → escalate to curriculum board"
+#
+# EMBEDDING MODEL: sentence-transformers/all-MiniLM-L6-v2
+#   - Free and local (no API key), downloads ~90MB once to ~/.cache/huggingface/
+#   - Runs on CPU, fast (~5ms per JD)
+#   - Converts text → 384 numbers that capture semantic meaning
+#
+# CHROMADB: local vector database — stores and searches those 384-dim vectors
+#   - Persists to output/rag_db/ so JDs accumulate across runs
+#   - Cosine similarity search finds "similar" JDs in milliseconds
+#
+# LANGCHAIN COMPONENTS USED:
+#   HuggingFaceEmbeddings   text → 384-dim vector (wraps sentence-transformers)
+#   Chroma                  stores/searches vectors on disk (wraps ChromaDB)
+#   Document                standard type: page_content (embedded) + metadata (stored as-is)
+
+_RAG_AVAILABLE = False
+_rag_embeddings: Optional[object] = None
+_rag_vectorstore: Optional[object] = None
+_RAG_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
 try:
-    from rag import store as rag_store
+    from langchain.schema import Document
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_community.vectorstores import Chroma
     _RAG_AVAILABLE = True
 except ImportError:
-    _RAG_AVAILABLE = False
-    rag_store = None  # type: ignore[assignment]
+    pass   # RAG is optional — pipeline works without it
+
+
+def _rag_get_vectorstore():
+    """
+    Initialize (or return cached) ChromaDB + HuggingFace embedding model.
+
+    ChromaDB persists all vectors to output/rag_db/ on disk.
+    JDs accumulate across runs — the more JDs processed, the better the context.
+
+    HuggingFaceEmbeddings loads all-MiniLM-L6-v2 locally (no API key needed).
+    First call downloads ~90MB once; subsequent calls reuse the cached model.
+    """
+    global _rag_embeddings, _rag_vectorstore
+
+    if _rag_vectorstore is not None:
+        return _rag_vectorstore
+
+    print("RAG: Loading embedding model (one-time ~30s download on first run)...")
+
+    # HuggingFaceEmbeddings wraps sentence-transformers.
+    # normalize_embeddings=True is required for cosine similarity to work correctly.
+    _rag_embeddings = HuggingFaceEmbeddings(
+        model_name    = _RAG_EMBED_MODEL,
+        model_kwargs  = {"device": "cpu"},                   # CPU — works on any machine
+        encode_kwargs = {"normalize_embeddings": True},      # needed for cosine similarity
+    )
+
+    # Chroma reads/writes vectors to RAG_DB_PATH.
+    # If the database exists, past JDs are immediately available.
+    _rag_vectorstore = Chroma(
+        collection_name    = "jds",
+        persist_directory  = str(config.RAG_DB_PATH),
+        embedding_function = _rag_embeddings,
+    )
+
+    count = _rag_vectorstore._collection.count()
+    print(f"RAG: Ready — {count} JD(s) in store at {config.RAG_DB_PATH.name}/")
+    return _rag_vectorstore
+
+
+def _rag_jd_to_text(jd: dict) -> str:
+    """
+    Convert a JD dict to a single text string for embedding.
+
+    Only the semantically meaningful fields are included in the vector
+    (role, skills, tech). Company/location/CTC go into metadata only.
+    """
+    parts = [
+        f"Role: {jd.get('role', '')}",
+        f"Skills: {', '.join(jd.get('required_skills', []))}",
+        f"Technologies: {', '.join(jd.get('tools_tech', []))}",
+        f"Responsibilities: {'; '.join(jd.get('responsibilities', [])[:3])}",
+        f"Nice to have: {', '.join(jd.get('nice_to_have', []))}",
+        f"Eligibility: {jd.get('eligibility', '')}",
+    ]
+    return "\n".join(p for p in parts if p.split(": ", 1)[-1].strip())
+
+
+def rag_add_jd(jd: dict) -> bool:
+    """
+    STORE STEP — embed a parsed JD and save to ChromaDB.
+
+    Called right after email_agent.parse_jd() succeeds.
+    The JD text is converted to a 384-number vector and stored on disk.
+    Future calls to rag_get_similar_jds() will find this JD when relevant.
+
+    Returns True on success, False on failure (non-fatal — pipeline continues).
+    """
+    if not _RAG_AVAILABLE:
+        return False
+    try:
+        vs      = _rag_get_vectorstore()
+        jd_text = _rag_jd_to_text(jd)
+        if not jd_text.strip():
+            return False
+
+        # Document: page_content is embedded → vector
+        #           metadata is stored as-is → returned on retrieval
+        doc = Document(
+            page_content = jd_text,
+            metadata = {
+                "company":  jd.get("company", "Unknown"),
+                "role":     jd.get("role", "Unknown"),
+                "location": jd.get("location", ""),
+                "deadline": jd.get("deadline", ""),
+                "ctc":      jd.get("ctc", ""),
+                # Full JD stored as JSON string so it can be reconstructed later
+                "jd_json":  json.dumps(jd),
+            },
+        )
+        vs.add_documents([doc])
+        print(f"RAG: Stored → {jd.get('company')} / {jd.get('role')}")
+        return True
+    except Exception as e:
+        print(f"RAG: add failed — {e}")
+        return False
+
+
+def rag_get_similar_jds(jd: dict, k: int = 3) -> list:
+    """
+    RETRIEVE STEP — find the k most semantically similar past JDs.
+
+    How it works:
+      1. Convert current JD to a 384-number vector
+      2. ChromaDB finds the k stored vectors closest to it (cosine similarity)
+      3. Return the original JD dicts from metadata
+
+    "Similar" = same role domain, overlapping skills.
+    A Python ML role surfaces other ML/data roles — not Java backend roles.
+
+    Returns empty list if store is empty or on error (non-fatal).
+    """
+    if not _RAG_AVAILABLE:
+        return []
+    try:
+        vs = _rag_get_vectorstore()
+        if vs._collection.count() == 0:
+            return []
+        query_text = _rag_jd_to_text(jd)
+        if not query_text.strip():
+            return []
+
+        # similarity_search: embed query, find k nearest vectors in ChromaDB
+        results = vs.similarity_search(query_text, k=k)
+
+        similar = []
+        for doc in results:
+            jd_json_str = doc.metadata.get("jd_json", "")
+            if jd_json_str:
+                try:
+                    similar.append(json.loads(jd_json_str))
+                except json.JSONDecodeError:
+                    pass
+        return similar
+    except Exception as e:
+        print(f"RAG: retrieve failed — {e}")
+        return []
+
+
+def rag_format_context(similar_jds: list) -> str:
+    """
+    AUGMENT STEP — format retrieved JDs as plain text for the LLM prompt.
+
+    This text is appended to the agent's user message so the LLM can reason:
+      "Python appears in all 3 past JDs → #1 must-study skill"
+      "DSA in 2/3 similar roles → add to prep plan even if not explicit here"
+
+    Returns empty string if no similar JDs (agents still work fine — RAG is additive).
+    """
+    if not similar_jds:
+        return ""
+    lines = [f"[{len(similar_jds)} SIMILAR PAST JD(s) FROM THIS SEMESTER FOR CONTEXT]"]
+    for i, past_jd in enumerate(similar_jds, 1):
+        lines.append(f"\nPast JD #{i}:")
+        lines.append(f"  Company : {past_jd.get('company', '?')}")
+        lines.append(f"  Role    : {past_jd.get('role', '?')}")
+        lines.append(f"  Skills  : {', '.join(past_jd.get('required_skills', []))}")
+        lines.append(f"  Tech    : {', '.join(past_jd.get('tools_tech', []))}")
+        if past_jd.get("ctc"):
+            lines.append(f"  CTC     : {past_jd.get('ctc')}")
+    return "\n".join(lines)
+
+
+def rag_get_skill_trends(top_n: int = 10) -> dict:
+    """
+    Count how often each skill appears across ALL stored JDs.
+    Returns {skill: count} sorted by frequency descending.
+    Useful for curriculum planning: "Python in 18/20 JDs — highest priority."
+    """
+    if not _RAG_AVAILABLE:
+        return {}
+    try:
+        vs    = _rag_get_vectorstore()
+        if vs._collection.count() == 0:
+            return {}
+        all_docs     = vs._collection.get(include=["metadatas"])
+        skill_counts: dict = {}
+        for meta in all_docs.get("metadatas", []):
+            jd_json_str = meta.get("jd_json", "")
+            if not jd_json_str:
+                continue
+            try:
+                past_jd = json.loads(jd_json_str)
+                for skill in past_jd.get("required_skills", []) + past_jd.get("tools_tech", []):
+                    key = skill.strip().lower()
+                    if key:
+                        skill_counts[key] = skill_counts.get(key, 0) + 1
+            except Exception:
+                pass
+        return dict(sorted(skill_counts.items(), key=lambda x: x[1], reverse=True)[:top_n])
+    except Exception as e:
+        print(f"RAG: skill_trends failed — {e}")
+        return {}
+
+
+def rag_get_store_stats() -> dict:
+    """Return count, unique companies, and top skills — shown in `python main.py status`."""
+    if not _RAG_AVAILABLE:
+        return {"total_jds": 0, "companies": [], "top_skills": {}}
+    try:
+        vs    = _rag_get_vectorstore()
+        total = vs._collection.count()
+        if total == 0:
+            return {"total_jds": 0, "companies": [], "top_skills": {}}
+        all_docs  = vs._collection.get(include=["metadatas"])
+        companies = sorted({
+            m.get("company", "") for m in all_docs.get("metadatas", []) if m.get("company")
+        })
+        return {"total_jds": total, "companies": companies, "top_skills": rag_get_skill_trends(5)}
+    except Exception as e:
+        return {"total_jds": 0, "companies": [], "top_skills": {}, "error": str(e)}
 
 
 # ── FASTAPI REST SERVER (started by `python main.py serve`) ──────────────────
@@ -230,7 +472,7 @@ if _FASTAPI_AVAILABLE:
         """Return RAG store stats: total JDs, companies, top skills."""
         if not _RAG_AVAILABLE:
             raise HTTPException(status_code=503, detail="RAG not available (chromadb not installed)")
-        return rag_store.get_store_stats()
+        return rag_get_store_stats()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,9 +552,9 @@ def run_pipeline(dry_run: bool = True) -> None:
         # AUGMENT:  Format those JDs as a context string to inject into agent prompts.
         rag_context = ""
         if _RAG_AVAILABLE:
-            rag_store.add_jd(jd)                           # embed + persist to disk
-            similar    = rag_store.get_similar_jds(jd)     # semantic search in ChromaDB
-            rag_context = rag_store.format_rag_context(similar)  # format for LLM prompt
+            rag_add_jd(jd)                              # embed + persist to disk
+            similar     = rag_get_similar_jds(jd)       # semantic search in ChromaDB
+            rag_context = rag_format_context(similar)   # format for LLM prompt
             if similar:
                 console.print(f"  RAG: [cyan]{len(similar)} similar past JD(s)[/cyan] added to agent context")
 
@@ -430,7 +672,7 @@ def cmd_status() -> None:
     # RAG store stats (if available)
     rag_line = "[dim]not installed — pip install chromadb langchain-community sentence-transformers[/dim]"
     if _RAG_AVAILABLE:
-        stats = rag_store.get_store_stats()
+        stats = rag_get_store_stats()
         top_skills = ", ".join(
             f"{k}({v})" for k, v in list(stats.get("top_skills", {}).items())[:5]
         )

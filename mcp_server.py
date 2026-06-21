@@ -72,12 +72,8 @@ def run_pipeline(dry_run: bool = True) -> str:
     from agents import email_agent, student_agent, teacher_agent
     from main import _save_jd
 
-    # RAG store (optional — pipeline works without it)
-    try:
-        from rag import store as rag_store
-        _rag_ok = True
-    except ImportError:
-        _rag_ok = False
+    # RAG functions are defined inline in main.py (no separate rag/ package)
+    from main import _RAG_AVAILABLE as _rag_ok, rag_add_jd, rag_get_similar_jds, rag_format_context
 
     # Step 1: Fetch unread POD emails
     emails = get_pod_emails()
@@ -111,9 +107,9 @@ def run_pipeline(dry_run: bool = True) -> str:
         # semantic similarity so agents can spot semester-wide skill trends.
         rag_context = ""
         if _rag_ok:
-            rag_store.add_jd(jd)
-            similar     = rag_store.get_similar_jds(jd)
-            rag_context = rag_store.format_rag_context(similar)
+            rag_add_jd(jd)
+            similar     = rag_get_similar_jds(jd)
+            rag_context = rag_format_context(similar)
 
         # Step 5: Agent 2 — Student brief (LangChain + Groq + RAG context)
         student_brief = student_agent.run(jd, rag_context=rag_context)
