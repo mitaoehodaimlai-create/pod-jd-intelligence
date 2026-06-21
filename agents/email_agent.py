@@ -98,7 +98,7 @@ def _get_llm() -> ChatGroq:
     return ChatGroq(
         model        = config.LLM_MODEL,
         api_key      = config.GROQ_API_KEY,
-        temperature  = 0.1,
+        temperature  = 0.7,
         model_kwargs = {"response_format": {"type": "json_object"}},
     )
 

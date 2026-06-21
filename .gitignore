@@ -30,6 +30,7 @@ coverage.xml
 # ── Runtime output (keep structure, ignore content) ──────────────
 output/jds/*.json
 output/drafts/*.json
+output/rag_db/
 # Keep the directories themselves
 !output/jds/.gitkeep
 !output/drafts/.gitkeep
