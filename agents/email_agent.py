@@ -17,7 +17,7 @@ LangSmith tracing:
 Exposed functions:
   run()            → fetch all new POD emails + return list of parsed JDs
   parse_jd()       → parse ONE combined text block into a structured JD dict
-                     (also called from workflow/graph.py as a node)
+                     (called from main.py, mcp_server.py, and api.py)
 """
 
 import json
@@ -149,8 +149,7 @@ def parse_jd(combined_text: str, message_id: str) -> dict | None:
     Parse a combined email+PDF text block into a structured JD dict
     using a LangChain chain (prompt → ChatGroq → JsonOutputParser).
 
-    This function is also called directly from workflow/graph.py as a
-    LangGraph node step.
+    Called from main.py, mcp_server.py, and api.py for each email.
 
     Args:
         combined_text: email subject + body + PDF text merged together
