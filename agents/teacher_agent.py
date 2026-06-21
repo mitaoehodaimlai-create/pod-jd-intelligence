@@ -1,138 +1,137 @@
 """
 AGENT 3 — TEACHER AGENT
 ========================
-This agent is the THIRD step in the pipeline.
+Generates curriculum update recommendations for faculty using a
+LangChain + ChatGroq chain.
 
-What it does:
-  Takes the same parsed Job Description and generates specific,
-  actionable curriculum update recommendations for faculty members.
+Libraries used:
+  langchain-groq  → ChatGroq LLM
+  langchain-core  → ChatPromptTemplate, StrOutputParser
+  langsmith       → @traceable (traces this agent in LangSmith dashboard)
 
-The recommendations include:
-  • Industry demand summary (what the market wants right now)
-  • Curriculum gaps (skills in JD not covered in B.Tech AIML syllabus)
-  • Suggested syllabus updates with CO-PO/PSO mapping (NBA/NAAC compliant)
-  • Practical lab exercises and tool-based assignments
-  • Study materials and references (NPTEL, Coursera, textbooks)
-  • 1-2 semester project ideas aligned with the JD
-  • Quick-win actions faculty can take THIS semester (no approval needed)
+LangSmith tracing:
+  Every call to run() is recorded as a separate trace in LangSmith.
+  Faculty recommendations can be compared and reviewed over time.
 
-Output:
-  A detailed Markdown text ready to be sent to faculty via email.
-
-Usage:
-    from agents.teacher_agent import run
-    recommendations = run(jd_dict)
+Output format:
+  Returns a Markdown string with these sections:
+    1. Industry Demand Summary
+    2. Curriculum Gaps
+    3. Suggested Syllabus Updates (with CO-PO mapping)
+    4. Practical Lab Approaches
+    5. Study Material & References
+    6. Semester Project Ideas
+    7. Quick-Win Actions This Semester
 """
 
-from groq import Groq
 import json
+
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langsmith import traceable
+
 import config
 
-# ------------------------------------------------------------------
-# PUBLIC FUNCTION  (called from main.py)
-# ------------------------------------------------------------------
 
-def run(jd):
+# ── LLM SETUP ────────────────────────────────────────────────────────────────
+
+def _get_llm():
     """
-    Generate curriculum update recommendations for faculty based on the JD.
-
-    Args:
-        jd: dict — the parsed Job Description from email_agent
-
-    Returns:
-        String containing full faculty recommendations in Markdown format
+    Create and return a ChatGroq LLM instance for teacher recommendations.
+    temperature=0.4 → some creativity for practical suggestions.
     """
-    print("\n=== TEACHER AGENT: Generating curriculum recommendations ===")
-    print(f"    Company: {jd.get('company')}  |  Role: {jd.get('role')}")
-
-    reco = _generate_with_groq(jd)
-
-    if reco:
-        print(f"    ✓ Teacher recommendations generated ({len(reco)} characters)")
-    else:
-        print("    ✗ Failed to generate teacher recommendations")
-
-    return reco or ""
+    return ChatGroq(
+        model       = config.LLM_MODEL,
+        api_key     = config.GROQ_API_KEY,
+        temperature = 0.4,
+    )
 
 
-# ------------------------------------------------------------------
-# PRIVATE HELPER
-# ------------------------------------------------------------------
+# ── PROMPT TEMPLATE ───────────────────────────────────────────────────────────
 
-def _generate_with_groq(jd):
-    """
-    Sends the JD to Groq AI with instructions to write faculty-specific
-    curriculum improvement recommendations.
+TEACHER_RECO_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """You are an academic curriculum advisor for MITAOE
+(Maharashtra Institute of Technology, Aurangabad) — an autonomous engineering college
+affiliated with Savitribai Phule Pune University (SPPU), India.
+Department: B.Tech CSE with specialization in Artificial Intelligence & Machine Learning.
 
-    Args:
-        jd: parsed JD dict
+A new placement JD has arrived. Based on it, write specific curriculum update
+recommendations for faculty members in Markdown format.
 
-    Returns:
-        Markdown text string, or None if API call fails
-    """
-
-    # Tell the AI about the academic context and what to generate
-    system_prompt = """You are an academic curriculum advisor for MITAOE (Maharashtra Institute
-of Technology, Aurangabad) — an autonomous college affiliated with SPPU, India.
-The department is B.Tech CSE with specialization in Artificial Intelligence & Machine Learning.
-
-A new Job Description has arrived from the campus placement office. Based on this JD,
-write specific curriculum update recommendations for faculty members in Markdown format.
-
-The recommendations must include these exact sections:
+Include EXACTLY these sections:
 
 ## 1. Industry Demand Summary
-(What this JD tells us about current industry requirements — 3-4 bullet points)
+(3-4 bullet points on what this JD signals about current market needs)
 
 ## 2. Curriculum Gaps
-(Skills in the JD that are NOT adequately covered in the standard B.Tech AIML syllabus.
-Name the specific subject/unit that is missing or weak — be direct, not vague)
+(Skills required in the JD that are NOT adequately covered in the B.Tech AIML syllabus.
+Name the specific subject and unit that is missing or weak — be direct.)
 
 ## 3. Suggested Syllabus Updates
-For each gap, specify:
+For each gap:
 - Which existing subject and unit to update
 - Exactly which topic to add or expand
-- CO-PO/PSO mapping (use CO1–CO6, PO1–PO12 numbering as per NBA norms)
+- CO-PO/PSO mapping (use CO1–CO6, PO1–PO12 as per NBA/NAAC norms)
 
 ## 4. Practical Lab Approaches
-(Specific hands-on exercises the faculty can add to existing lab sessions.
-Give: tool name + dataset name + learning outcome for each suggestion)
+(Specific hands-on exercises to add to existing lab sessions.
+Format: Tool name + Dataset/task + Expected learning outcome)
 
 ## 5. Study Material & References
-(Specific resources: NPTEL course links, Coursera/edX specializations,
-textbook names with authors, GitHub repositories worth assigning as reading)
+(Specific resources: NPTEL course links, Coursera/edX courses,
+textbook name + author, GitHub repos worth assigning)
 
 ## 6. Semester Project Ideas
-(1-2 complete project titles with a 2-line scope — projects students can
-do in one semester that demonstrate the skills the JD requires)
+(1-2 complete project titles with a 2-line scope that demonstrates JD skills)
 
 ## 7. Quick-Win Actions This Semester
-(Things a faculty member can do WITHOUT waiting for official syllabus revision:
-guest lecture, add a tool tutorial, assign an online course as extra credit, etc.)
+(Things faculty can do WITHOUT official syllabus revision:
+ guest lecture, extra reading, tool demo in class, online assignment, etc.)
 
-Keep recommendations specific to AIML engineering education in India.
-Write for faculty who understand academic constraints (syllabus approval process,
-NBA/NAAC compliance, limited lab time).
-"""
+Rules:
+- Write for faculty who understand academic constraints (NBA, NAAC, approval process)
+- Be specific to AIML engineering education — no generic higher-ed advice
+- Focus on practical, immediately actionable suggestions""",
+    ),
+    ("human", "Job Description:\n{jd_json}"),
+])
 
-    # Convert the JD dict to a readable JSON string
-    jd_text = json.dumps(jd, indent=2, ensure_ascii=False)
+
+# ── PUBLIC FUNCTION ───────────────────────────────────────────────────────────
+
+@traceable(name="teacher-agent", run_type="chain")
+def run(jd: dict) -> str:
+    """
+    Generate faculty curriculum recommendations for the given Job Description.
+
+    Uses a LangChain chain:
+      Prompt template → ChatGroq LLM → StrOutputParser (plain text output)
+
+    LangSmith traces this entire run — you can review what was recommended
+    for each JD in the LangSmith dashboard.
+
+    Args:
+        jd: parsed JD dict from email_agent (company, role, skills, etc.)
+
+    Returns:
+        Markdown string with full curriculum recommendations,
+        or "" if the API call failed.
+    """
+    print("\n=== TEACHER AGENT: Generating curriculum recommendations ===")
+    print(f"    Company : {jd.get('company')}  |  Role : {jd.get('role')}")
 
     try:
-        client = Groq(api_key=config.GROQ_API_KEY)
+        # LangChain chain: prompt → LLM → plain text parser
+        chain = TEACHER_RECO_PROMPT | _get_llm() | StrOutputParser()
 
-        response = client.chat.completions.create(
-            model=config.LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": f"Job Description:\n{jd_text}"},
-            ],
-            max_tokens=3000,
-            temperature=0.4,  # Some creativity needed for good recommendations
-        )
+        reco = chain.invoke({"jd_json": json.dumps(jd, indent=2)})
 
-        return response.choices[0].message.content.strip()
+        print(f"    ✓ Teacher reco ready ({len(reco)} characters)")
+        return reco
 
     except Exception as e:
-        print(f"    Groq API error: {e}")
-        return None
+        print(f"    ✗ Groq/LangChain error: {e}")
+        return ""

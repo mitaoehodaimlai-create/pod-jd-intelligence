@@ -1,212 +1,178 @@
 """
 AGENT 1 — EMAIL AGENT
 ======================
-This agent is the FIRST step in the pipeline.
+Reads POD emails, extracts PDF text, and parses the Job Description
+using a LangChain + ChatGroq chain.
 
-What it does:
-  1. Reads unread emails from the POD (Placement Office) inbox
-  2. Skips emails that are NOT from trusted POD senders
-  3. Downloads PDF attachments from each valid email
-  4. Extracts text from those PDFs
-  5. Asks Groq AI (Llama 3.3) to read the email + PDF and
-     pull out a clean, structured Job Description
+Libraries used:
+  langchain-groq   → ChatGroq LLM (calls Groq API through LangChain)
+  langchain-core   → ChatPromptTemplate (builds the prompt), JsonOutputParser
+  langsmith        → @traceable (records this step in LangSmith dashboard)
 
-Output:
-  A list of JD dicts, one per email, e.g.:
-  {
-    "company":         "TCS",
-    "role":            "Software Engineer",
-    "location":        "Pune",
-    "eligibility":     "CGPA >= 6.5, CSE/AIML, 2025 batch",
-    "required_skills": ["Python", "SQL", "Data Structures"],
-    "tools_tech":      ["Git", "Linux"],
-    "responsibilities":["Write backend code", "Code reviews"],
-    "nice_to_have":    ["Docker", "AWS"],
-    "ctc":             "3.5 LPA",
-    "deadline":        "30 June 2025",
-    "source_email_id": "<msg001@mail.com>"
-  }
+LangSmith tracing:
+  Every call to parse_jd() appears as a traced run in LangSmith under
+  the project name from LANGCHAIN_PROJECT in your .env file.
+  View traces at: https://smith.langchain.com
 
-Usage:
-    from agents.email_agent import run
-    jd_list = run()
+Exposed functions:
+  run()            → fetch all new POD emails + return list of parsed JDs
+  parse_jd()       → parse ONE combined text block into a structured JD dict
+                     (also called from workflow/graph.py as a node)
 """
 
 import json
 import re
 
-from groq import Groq
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+from langsmith import traceable
 
 import config
 from services.email_service import get_pod_emails
 from services.pdf_service import extract_text_from_pdf
 
-# ------------------------------------------------------------------
-# PUBLIC FUNCTION  (called from main.py and mcp_server.py)
-# ------------------------------------------------------------------
 
+# ── LLM SETUP ────────────────────────────────────────────────────────────────
+
+def _get_llm():
+    """
+    Create and return a ChatGroq LLM instance configured for JD parsing.
+    temperature=0.1 → very deterministic, consistent JSON output.
+    """
+    return ChatGroq(
+        model    = config.LLM_MODEL,
+        api_key  = config.GROQ_API_KEY,
+        temperature = 0.1,
+        model_kwargs = {"response_format": {"type": "json_object"}},  # Force JSON
+    )
+
+
+# ── JD PARSING PROMPT ────────────────────────────────────────────────────────
+
+# This template is sent to the LLM.
+# {content} is replaced with the actual email+PDF text at runtime.
+JD_PARSER_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        """You are a Job Description (JD) parser for an academic placement office.
+
+Read the email subject, body, and any PDF content provided.
+Extract the job information and return ONLY a valid JSON object with these exact keys:
+
+{{
+  "company":          "name of the hiring company",
+  "role":             "job title / position name",
+  "location":         "city or Remote",
+  "eligibility":      "CGPA cutoff, allowed branches, year of passing",
+  "required_skills":  ["skill1", "skill2", "skill3"],
+  "tools_tech":       ["tool1", "technology2"],
+  "responsibilities": ["what the employee will do"],
+  "nice_to_have":     ["optional preferred skills"],
+  "ctc":              "salary or stipend package",
+  "deadline":         "last date to apply"
+}}
+
+Rules:
+- Use "Not mentioned" for any string field not found in the text
+- Use [] for any list field not found in the text
+- Do NOT add any extra keys beyond the ones listed above
+- Return only the JSON — no explanation, no markdown fences""",
+    ),
+    ("human", "{content}"),
+])
+
+
+# ── PUBLIC FUNCTIONS ─────────────────────────────────────────────────────────
+
+@traceable(name="email-agent-run", run_type="chain")
 def run():
     """
-    Fetch all new POD emails and return a list of parsed JD dicts.
+    Main function: fetch all new POD emails and return parsed JDs.
 
-    Steps inside this function:
-      1. Call email_service to get unread POD emails
-      2. For each email, extract PDF text
-      3. Send combined content to Groq AI for structured JD extraction
-      4. Collect and return all results
+    Steps:
+      1. Connect to inbox via IMAP and get unread POD emails
+      2. Extract text from PDF attachments
+      3. Call parse_jd() for each email to get structured JD
+      4. Return list of all successfully parsed JDs
 
     Returns:
-        List of JD dicts (empty list if no new emails)
+        List of JD dicts (empty list if no new emails or all failed)
     """
     print("\n=== EMAIL AGENT: Checking POD inbox ===")
 
-    # Step 1 — Get emails (only from trusted POD senders, with JD keywords)
+    # Step 1: Get emails from trusted POD senders only
     emails = get_pod_emails()
 
     if not emails:
-        print("No new POD emails to process.")
+        print("No new POD emails found.")
         return []
 
     parsed_jds = []
 
     for i, email in enumerate(emails, start=1):
-        print(f"\n[{i}/{len(emails)}] Subject: {email['subject']}")
-        print(f"       From:    {email['sender']}")
+        print(f"\n[{i}/{len(emails)}] Subject : {email['subject']}")
+        print(f"             From    : {email['sender']}")
 
-        # Step 2 — Extract text from each PDF attachment
-        pdf_texts = _extract_all_pdfs(email["attachments"])
+        # Step 2: Extract PDF attachment text
+        pdf_texts = []
+        for filename, pdf_bytes in email["attachments"].items():
+            text = extract_text_from_pdf(pdf_bytes)
+            if text:
+                pdf_texts.append(f"--- PDF: {filename} ---\n{text}")
+                print(f"             PDF     : extracted {len(text)} chars from {filename}")
 
-        # Step 3 — Build one combined text block (email + PDFs) for the AI
-        combined_text = _combine_content(email, pdf_texts)
+        # Step 3: Combine everything into one text block for the AI
+        combined = (
+            f"Subject: {email['subject']}\n\n"
+            f"Email Body:\n{email['body']}"
+        )
+        if pdf_texts:
+            combined += "\n\n" + "\n\n".join(pdf_texts)
 
-        # Step 4 — Ask Groq AI to parse the JD
-        jd = _parse_jd_with_groq(combined_text, email["message_id"])
+        # Step 4: Parse JD with LangChain + Groq
+        jd = parse_jd(combined, email["message_id"])
 
         if jd:
             parsed_jds.append(jd)
-            print(f"       ✓ Parsed: {jd.get('company')} — {jd.get('role')}")
+            print(f"             ✓ Parsed : {jd.get('company')} — {jd.get('role')}")
         else:
-            print(f"       ✗ Could not parse JD from this email")
+            print(f"             ✗ Failed to parse JD from this email")
 
-    print(f"\n=== EMAIL AGENT: Done. Parsed {len(parsed_jds)} JD(s). ===")
+    print(f"\n=== EMAIL AGENT: Done. {len(parsed_jds)} JD(s) parsed. ===")
     return parsed_jds
 
 
-# ------------------------------------------------------------------
-# PRIVATE HELPERS  (used only inside this file)
-# ------------------------------------------------------------------
-
-def _extract_all_pdfs(attachments):
+@traceable(name="parse-jd", run_type="llm")
+def parse_jd(combined_text: str, message_id: str) -> dict | None:
     """
-    Extract text from every PDF attachment in the email.
+    Parse a combined email+PDF text block into a structured JD dict
+    using a LangChain chain (prompt → ChatGroq → JsonOutputParser).
+
+    This function is also called directly from workflow/graph.py as a
+    LangGraph node step.
 
     Args:
-        attachments: dict of { "filename.pdf": <bytes>, ... }
+        combined_text: email subject + body + PDF text merged together
+        message_id:    the email's Message-ID (stored for reference)
 
     Returns:
-        List of strings, one per PDF that had readable text
+        Dict with JD fields, or None if parsing failed
     """
-    pdf_texts = []
-
-    for filename, pdf_bytes in attachments.items():
-        print(f"       Reading PDF: {filename}")
-        text = extract_text_from_pdf(pdf_bytes)
-
-        if text:
-            # Tag the text so the AI knows where it came from
-            pdf_texts.append(f"--- Content from PDF: {filename} ---\n{text}")
-            print(f"       ✓ Extracted {len(text)} characters from {filename}")
-        else:
-            print(f"       ✗ Could not extract text from {filename}")
-
-    return pdf_texts
-
-
-def _combine_content(email, pdf_texts):
-    """
-    Join the email subject, body, and PDF text into one big string.
-    This combined text is what we send to the AI.
-
-    The 12000 character limit prevents hitting Groq token limits.
-    """
-    parts = [
-        f"EMAIL SUBJECT: {email['subject']}",
-        f"\nEMAIL BODY:\n{email['body']}",
-    ]
-
-    if pdf_texts:
-        parts.append("\n\nPDF ATTACHMENTS:\n" + "\n\n".join(pdf_texts))
-
-    combined = "\n".join(parts)
-
-    # Trim to safe length
-    return combined[:12000]
-
-
-def _parse_jd_with_groq(combined_text, message_id):
-    """
-    Send the combined email + PDF text to Groq AI and ask it to
-    extract the Job Description fields as structured JSON.
-
-    Args:
-        combined_text: email body + PDF text merged together
-        message_id:    the email's Message-ID header (for traceability)
-
-    Returns:
-        Dict with JD fields, or None if AI parsing failed
-    """
-
-    # This is the instruction we give to the AI (called "system prompt")
-    system_prompt = """You are a Job Description parser for an academic placement office in India.
-
-Read the email and PDF content and extract ONLY the job information.
-Return a valid JSON object with EXACTLY these keys (no markdown, no explanation):
-
-{
-  "company":         "name of the company",
-  "role":            "job title / position",
-  "location":        "city, or Remote",
-  "eligibility":     "CGPA cutoff, allowed branches, year of passing",
-  "required_skills": ["list", "of", "required", "skills"],
-  "tools_tech":      ["tools", "and", "technologies", "mentioned"],
-  "responsibilities":["what", "the", "employee", "will", "do"],
-  "nice_to_have":    ["optional", "preferred", "skills"],
-  "ctc":             "salary or stipend package",
-  "deadline":        "last date to apply"
-}
-
-Rules:
-- Use "Not mentioned" for any string field that is not in the text
-- Use [] for any list field that is not in the text
-- Do NOT add any extra fields beyond the ones listed above
-"""
-
     try:
-        client = Groq(api_key=config.GROQ_API_KEY)
+        # Build the LangChain chain:
+        #   Prompt template → ChatGroq LLM → JSON output parser
+        # LangSmith traces every step of this chain automatically.
+        chain = JD_PARSER_PROMPT | _get_llm() | JsonOutputParser()
 
-        response = client.chat.completions.create(
-            model=config.LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": combined_text},
-            ],
-            max_tokens=1000,
-            temperature=0.1,                           # Low = more consistent
-            response_format={"type": "json_object"},   # Force JSON output
-        )
+        # Trim to safe length (avoids hitting Groq token limits)
+        jd = chain.invoke({"content": combined_text[:12000]})
 
-        # Parse the AI's JSON response
-        raw_json = response.choices[0].message.content
-        # Remove markdown fences if the AI added them accidentally
-        raw_json = re.sub(r"```json|```", "", raw_json).strip()
-
-        jd = json.loads(raw_json)
-
-        # Store which email this JD came from (for reference)
+        # Attach the source email ID for traceability
         jd["source_email_id"] = message_id
 
         return jd
 
     except Exception as e:
-        print(f"       Groq API error: {e}")
+        print(f"  Groq/LangChain error in parse_jd: {e}")
         return None

@@ -1,13 +1,26 @@
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-groq>=0.9.0
-langsmith>=0.1.120
-langgraph>=0.2.50
-langchain-core>=0.3.0
-mcp[cli]>=1.3.0
-pdfplumber>=0.11.0
-pypdf>=4.3.0
-python-dotenv>=1.0.0
-pydantic>=2.10.0
-rich>=13.9.0
-imap-tools>=1.7.0
+# ── LangChain ecosystem ──────────────────────────────────────────
+langchain>=0.3.0                # Core LangChain (chains, prompts, parsers)
+langchain-core>=0.3.0           # Base abstractions (Runnable, etc.)
+langchain-groq>=0.2.0           # LangChain wrapper for Groq LLMs
+langgraph>=0.2.50               # Graph-based agent orchestration
+langsmith>=0.1.120              # LLM monitoring, tracing, and evaluation
+
+# ── Groq API ─────────────────────────────────────────────────────
+groq>=0.9.0                     # Raw Groq SDK (used as fallback only)
+
+# ── FastAPI + MCP ────────────────────────────────────────────────
+fastapi>=0.115.0                # REST API server
+uvicorn[standard]>=0.30.0       # ASGI server to run FastAPI
+mcp[cli]>=1.3.0                 # MCP server (Claude Code tool integration)
+
+# ── Email ────────────────────────────────────────────────────────
+imap-tools>=1.7.0               # Clean IMAP client for reading emails
+
+# ── PDF extraction ───────────────────────────────────────────────
+pdfplumber>=0.11.0              # Primary PDF text extractor
+pypdf>=4.3.0                    # Fallback PDF text extractor
+
+# ── Utilities ────────────────────────────────────────────────────
+python-dotenv>=1.0.0            # Load .env file into environment variables
+pydantic>=2.10.0                # Data validation (used by LangChain + FastAPI)
+rich>=13.9.0                    # Pretty terminal output
