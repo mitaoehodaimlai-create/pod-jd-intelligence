@@ -32,41 +32,61 @@ from services.email_service import send_email
 # SAVE  (always runs — no emails sent here)
 # ------------------------------------------------------------------
 
-def save_drafts(jd, student_brief, teacher_reco):
+def save_drafts(jd, student_brief, teacher_reco, skill_upgrade="", reminder=""):
     """
-    Save two draft emails to output/drafts/ as JSON files.
-    Returns a list of draft info dicts so main.py can print them.
+    Save up to 4 draft emails to output/drafts/ as JSON files.
 
-    Args:
-        jd:            parsed JD dict (company, role, etc.)
-        student_brief: text output from the Student Agent
-        teacher_reco:  text output from the Teacher Agent
+    Drafts saved:
+      1. student  — interview prep brief  → STUDENT_LIST_EMAIL
+      2. teacher  — curriculum reco       → FACULTY_LIST_EMAIL
+      3. upgrade  — skill gap + roadmap   → STUDENT_LIST_EMAIL  (if provided)
+      4. reminder — deadline + day plan   → STUDENT_LIST_EMAIL  (if provided)
+
+    Returns list of draft info dicts.
     """
-    company = jd.get("company", "Company")
-    role    = jd.get("role", "Role")
-
-    # Base subject prefix so recipients know this came from the POD pipeline
+    company      = jd.get("company", "Company")
+    role         = jd.get("role", "Role")
+    deadline     = jd.get("deadline", "")
     base_subject = f"[Placement] {company} – {role}"
 
     saved_drafts = []
 
-    # --- Draft 1: Student notification ---
-    student_draft = _create_draft(
-        to      = config.STUDENT_LIST_EMAIL,
-        subject = f"{base_subject} | Interview Prep Brief",
-        body    = student_brief,
-        label   = "student"
-    )
-    saved_drafts.append(student_draft)
+    # Draft 1: Student prep brief
+    if student_brief:
+        saved_drafts.append(_create_draft(
+            to      = config.STUDENT_LIST_EMAIL,
+            subject = f"{base_subject} | Interview Prep Brief",
+            body    = student_brief,
+            label   = "student",
+        ))
 
-    # --- Draft 2: Faculty notification ---
-    teacher_draft = _create_draft(
-        to      = config.FACULTY_LIST_EMAIL,
-        subject = f"{base_subject} | Curriculum Recommendation",
-        body    = teacher_reco,
-        label   = "teacher"
-    )
-    saved_drafts.append(teacher_draft)
+    # Draft 2: Faculty curriculum reco
+    if teacher_reco:
+        saved_drafts.append(_create_draft(
+            to      = config.FACULTY_LIST_EMAIL,
+            subject = f"{base_subject} | Curriculum Recommendation",
+            body    = teacher_reco,
+            label   = "teacher",
+        ))
+
+    # Draft 3: Skill upgrade roadmap → students
+    if skill_upgrade:
+        saved_drafts.append(_create_draft(
+            to      = config.STUDENT_LIST_EMAIL,
+            subject = f"{base_subject} | Skill Upgrade Roadmap",
+            body    = skill_upgrade,
+            label   = "upgrade",
+        ))
+
+    # Draft 4: Application reminder + deadline prep plan → students
+    if reminder:
+        deadline_tag = f" | Deadline: {deadline}" if deadline else ""
+        saved_drafts.append(_create_draft(
+            to      = config.STUDENT_LIST_EMAIL,
+            subject = f"{base_subject} | Apply Now{deadline_tag}",
+            body    = reminder,
+            label   = "reminder",
+        ))
 
     return saved_drafts
 

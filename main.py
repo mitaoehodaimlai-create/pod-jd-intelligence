@@ -65,7 +65,7 @@ from rich.table import Table
 from rich.panel import Panel
 
 # Agents — do the LLM work via LangChain + Groq
-from agents import email_agent, student_agent, teacher_agent
+from agents import email_agent, student_agent, teacher_agent, skill_upgrade_agent, reminder_agent
 
 # Services — handle email I/O, PDF extraction, draft file management
 from services.email_service import get_pod_emails
@@ -107,55 +107,40 @@ console = Console()
 #   Document                standard type: page_content (embedded) + metadata (stored as-is)
 
 _RAG_AVAILABLE = False
-_rag_embeddings: Optional[object] = None
-_rag_vectorstore: Optional[object] = None
-_RAG_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+_chroma_client: Optional[object] = None
+_chroma_collection: Optional[object] = None
 
 try:
-    from langchain.schema import Document
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-    from langchain_community.vectorstores import Chroma
+    import chromadb as _chromadb
+    from chromadb.utils.embedding_functions import DefaultEmbeddingFunction as _ChromaEF
     _RAG_AVAILABLE = True
 except ImportError:
     pass   # RAG is optional — pipeline works without it
 
 
-def _rag_get_vectorstore():
+def _rag_get_collection():
     """
-    Initialize (or return cached) ChromaDB + HuggingFace embedding model.
+    Initialize (or return cached) ChromaDB persistent collection.
 
-    ChromaDB persists all vectors to output/rag_db/ on disk.
-    JDs accumulate across runs — the more JDs processed, the better the context.
-
-    HuggingFaceEmbeddings loads all-MiniLM-L6-v2 locally (no API key needed).
-    First call downloads ~90MB once; subsequent calls reuse the cached model.
+    Uses ChromaDB's built-in ONNX embedding (all-MiniLM-L6-v2, 384-dim).
+    No sentence-transformers / torch / torchvision required.
+    First call downloads ~79MB ONNX model once to ~/.cache/chroma/
     """
-    global _rag_embeddings, _rag_vectorstore
+    global _chroma_client, _chroma_collection
 
-    if _rag_vectorstore is not None:
-        return _rag_vectorstore
+    if _chroma_collection is not None:
+        return _chroma_collection
 
-    print("RAG: Loading embedding model (one-time ~30s download on first run)...")
-
-    # HuggingFaceEmbeddings wraps sentence-transformers.
-    # normalize_embeddings=True is required for cosine similarity to work correctly.
-    _rag_embeddings = HuggingFaceEmbeddings(
-        model_name    = _RAG_EMBED_MODEL,
-        model_kwargs  = {"device": "cpu"},                   # CPU — works on any machine
-        encode_kwargs = {"normalize_embeddings": True},      # needed for cosine similarity
+    print("RAG: Initialising ChromaDB (ONNX all-MiniLM-L6-v2)...")
+    _chroma_client = _chromadb.PersistentClient(path=str(config.RAG_DB_PATH))
+    _chroma_collection = _chroma_client.get_or_create_collection(
+        name               = "jds",
+        embedding_function = _ChromaEF(),
+        metadata           = {"hnsw:space": "cosine"},
     )
-
-    # Chroma reads/writes vectors to RAG_DB_PATH.
-    # If the database exists, past JDs are immediately available.
-    _rag_vectorstore = Chroma(
-        collection_name    = "jds",
-        persist_directory  = str(config.RAG_DB_PATH),
-        embedding_function = _rag_embeddings,
-    )
-
-    count = _rag_vectorstore._collection.count()
+    count = _chroma_collection.count()
     print(f"RAG: Ready — {count} JD(s) in store at {config.RAG_DB_PATH.name}/")
-    return _rag_vectorstore
+    return _chroma_collection
 
 
 def _rag_jd_to_text(jd: dict) -> str:
@@ -179,37 +164,32 @@ def _rag_jd_to_text(jd: dict) -> str:
 def rag_add_jd(jd: dict) -> bool:
     """
     STORE STEP — embed a parsed JD and save to ChromaDB.
-
-    Called right after email_agent.parse_jd() succeeds.
-    The JD text is converted to a 384-number vector and stored on disk.
-    Future calls to rag_get_similar_jds() will find this JD when relevant.
-
-    Returns True on success, False on failure (non-fatal — pipeline continues).
+    Returns True on success, False on failure (non-fatal).
     """
     if not _RAG_AVAILABLE:
         return False
     try:
-        vs      = _rag_get_vectorstore()
+        col     = _rag_get_collection()
         jd_text = _rag_jd_to_text(jd)
         if not jd_text.strip():
             return False
 
-        # Document: page_content is embedded → vector
-        #           metadata is stored as-is → returned on retrieval
-        doc = Document(
-            page_content = jd_text,
-            metadata = {
-                "company":  jd.get("company", "Unknown"),
-                "role":     jd.get("role", "Unknown"),
-                "location": jd.get("location", ""),
-                "deadline": jd.get("deadline", ""),
-                "ctc":      jd.get("ctc", ""),
-                # Full JD stored as JSON string so it can be reconstructed later
+        doc_id = jd.get("message_id", "") or f"{jd.get('company','')}-{jd.get('role','')}"
+        doc_id = doc_id.replace(" ", "_")[:64]
+
+        col.upsert(
+            ids       = [doc_id],
+            documents = [jd_text],
+            metadatas = [{
+                "company":  str(jd.get("company", "Unknown")),
+                "role":     str(jd.get("role", "Unknown")),
+                "location": str(jd.get("location", "")),
+                "deadline": str(jd.get("deadline", "")),
+                "ctc":      str(jd.get("ctc", "")),
                 "jd_json":  json.dumps(jd),
-            },
+            }],
         )
-        vs.add_documents([doc])
-        print(f"RAG: Stored → {jd.get('company')} / {jd.get('role')}")
+        print(f"RAG: Stored → {jd.get('company')} / {jd.get('role')}  (total: {col.count()})")
         return True
     except Exception as e:
         print(f"RAG: add failed — {e}")
@@ -218,34 +198,23 @@ def rag_add_jd(jd: dict) -> bool:
 
 def rag_get_similar_jds(jd: dict, k: int = 3) -> list:
     """
-    RETRIEVE STEP — find the k most semantically similar past JDs.
-
-    How it works:
-      1. Convert current JD to a 384-number vector
-      2. ChromaDB finds the k stored vectors closest to it (cosine similarity)
-      3. Return the original JD dicts from metadata
-
-    "Similar" = same role domain, overlapping skills.
-    A Python ML role surfaces other ML/data roles — not Java backend roles.
-
+    RETRIEVE STEP — find k semantically similar past JDs via cosine similarity.
     Returns empty list if store is empty or on error (non-fatal).
     """
     if not _RAG_AVAILABLE:
         return []
     try:
-        vs = _rag_get_vectorstore()
-        if vs._collection.count() == 0:
+        col = _rag_get_collection()
+        if col.count() == 0:
             return []
         query_text = _rag_jd_to_text(jd)
         if not query_text.strip():
             return []
 
-        # similarity_search: embed query, find k nearest vectors in ChromaDB
-        results = vs.similarity_search(query_text, k=k)
-
+        results = col.query(query_texts=[query_text], n_results=min(k, col.count()))
         similar = []
-        for doc in results:
-            jd_json_str = doc.metadata.get("jd_json", "")
+        for meta in (results.get("metadatas") or [[]])[0]:
+            jd_json_str = meta.get("jd_json", "")
             if jd_json_str:
                 try:
                     similar.append(json.loads(jd_json_str))
@@ -260,12 +229,7 @@ def rag_get_similar_jds(jd: dict, k: int = 3) -> list:
 def rag_format_context(similar_jds: list) -> str:
     """
     AUGMENT STEP — format retrieved JDs as plain text for the LLM prompt.
-
-    This text is appended to the agent's user message so the LLM can reason:
-      "Python appears in all 3 past JDs → #1 must-study skill"
-      "DSA in 2/3 similar roles → add to prep plan even if not explicit here"
-
-    Returns empty string if no similar JDs (agents still work fine — RAG is additive).
+    Returns empty string if no similar JDs (agents work fine without it).
     """
     if not similar_jds:
         return ""
@@ -283,17 +247,16 @@ def rag_format_context(similar_jds: list) -> str:
 
 def rag_get_skill_trends(top_n: int = 10) -> dict:
     """
-    Count how often each skill appears across ALL stored JDs.
-    Returns {skill: count} sorted by frequency descending.
-    Useful for curriculum planning: "Python in 18/20 JDs — highest priority."
+    Count skill frequency across ALL stored JDs.
+    Returns {skill: count} sorted descending — useful for curriculum planning.
     """
     if not _RAG_AVAILABLE:
         return {}
     try:
-        vs    = _rag_get_vectorstore()
-        if vs._collection.count() == 0:
+        col = _rag_get_collection()
+        if col.count() == 0:
             return {}
-        all_docs     = vs._collection.get(include=["metadatas"])
+        all_docs     = col.get(include=["metadatas"])
         skill_counts: dict = {}
         for meta in all_docs.get("metadatas", []):
             jd_json_str = meta.get("jd_json", "")
@@ -314,15 +277,15 @@ def rag_get_skill_trends(top_n: int = 10) -> dict:
 
 
 def rag_get_store_stats() -> dict:
-    """Return count, unique companies, and top skills — shown in `python main.py status`."""
+    """Return count, companies, top skills — shown in `python main.py status`."""
     if not _RAG_AVAILABLE:
         return {"total_jds": 0, "companies": [], "top_skills": {}}
     try:
-        vs    = _rag_get_vectorstore()
-        total = vs._collection.count()
+        col   = _rag_get_collection()
+        total = col.count()
         if total == 0:
             return {"total_jds": 0, "companies": [], "top_skills": {}}
-        all_docs  = vs._collection.get(include=["metadatas"])
+        all_docs  = col.get(include=["metadatas"])
         companies = sorted({
             m.get("company", "") for m in all_docs.get("metadatas", []) if m.get("company")
         })
@@ -338,7 +301,7 @@ def rag_get_store_stats() -> dict:
 
 _FASTAPI_AVAILABLE = False
 try:
-    from fastapi import BackgroundTasks, FastAPI, HTTPException
+    from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
     from pydantic import BaseModel as _PydanticModel
     import uvicorn as _uvicorn
     _FASTAPI_AVAILABLE = True
@@ -410,6 +373,78 @@ if _FASTAPI_AVAILABLE:
     def _api_pipeline_status():
         """Return the result of the last pipeline run."""
         return _last_run_state
+
+    @_api_app.post("/pipeline/upload", tags=["Pipeline"])
+    async def _api_upload_pdf(
+        file: UploadFile = File(..., description="PDF file containing the Job Description"),
+        dry_run: bool = True,
+    ):
+        """
+        Upload a PDF directly and run the full pipeline — no email needed.
+
+        Use this to test the pipeline from Swagger UI:
+        1. Click 'Try it out'
+        2. Choose a JD PDF file
+        3. Click Execute — get student brief + teacher reco saved as drafts
+        """
+        if not file.filename or not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+
+        pdf_bytes = await file.read()
+        if not pdf_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+        # Extract text from the uploaded PDF
+        pdf_text = extract_text_from_pdf(pdf_bytes)
+        if not pdf_text:
+            raise HTTPException(status_code=422, detail="Could not extract text from PDF.")
+
+        combined = f"Subject: {file.filename}\n\nPDF Content:\n{pdf_text}"
+
+        # Agent 1 — parse JD
+        import uuid as _uuid
+        message_id = f"upload-{_uuid.uuid4().hex[:8]}"
+        jd = email_agent.parse_jd(combined, message_id)
+        if not jd:
+            raise HTTPException(status_code=422, detail="LLM could not parse a Job Description from this PDF.")
+
+        _save_jd(jd)
+
+        # RAG context (if available)
+        rag_context = ""
+        if _RAG_AVAILABLE:
+            rag_add_jd(jd)
+            similar     = rag_get_similar_jds(jd)
+            rag_context = rag_format_context(similar)
+
+        # Agent 2 — student brief
+        student_brief = student_agent.run(jd, rag_context=rag_context)
+
+        # Agent 3 — teacher reco
+        teacher_reco = teacher_agent.run(jd, rag_context=rag_context)
+
+        # Save drafts
+        drafts = draft_service.save_drafts(jd, student_brief, teacher_reco)
+
+        if not dry_run:
+            for d in drafts:
+                draft_service.send_approved_draft(d["path"])
+
+        return {
+            "status":   "ok",
+            "dry_run":  dry_run,
+            "filename": file.filename,
+            "jd": {
+                "company":         jd.get("company"),
+                "role":            jd.get("role"),
+                "deadline":        jd.get("deadline"),
+                "required_skills": jd.get("required_skills", []),
+            },
+            "drafts": [
+                {"draft_id": d["draft_id"], "recipient": d["recipient"], "path": d["path"]}
+                for d in drafts
+            ],
+        }
 
     # ── JD endpoints ─────────────────────────────────────────────────────────
 
@@ -558,24 +593,33 @@ def run_pipeline(dry_run: bool = True) -> None:
             if similar:
                 console.print(f"  RAG: [cyan]{len(similar)} similar past JD(s)[/cyan] added to agent context")
 
-        # ── STEP 5: Agent 2 — Student Prep Brief (LangChain + Groq) ──────────
-        # LLM chain: ChatPromptTemplate → ChatGroq → StrOutputParser
-        # rag_context adds historical patterns so the LLM can emphasize
-        # skills that appear repeatedly across similar roles this semester.
+        # ── STEP 5: Agent 2 — Student Prep Brief ─────────────────────────────
         with console.status("Agent 2 (student_agent): generating prep brief..."):
             student_brief = student_agent.run(jd, rag_context=rag_context)
 
-        # ── STEP 6: Agent 3 — Teacher Curriculum Reco (LangChain + Groq) ─────
-        # Same chain pattern. RAG context helps the LLM detect RECURRING
-        # curriculum gaps (seen in multiple JDs) vs one-off skill requests.
+        # ── STEP 6: Agent 3 — Teacher Curriculum Reco ────────────────────────
         with console.status("Agent 3 (teacher_agent): generating curriculum reco..."):
             teacher_reco = teacher_agent.run(jd, rag_context=rag_context)
 
-        # ── STEP 7: Save draft emails ─────────────────────────────────────────
-        # Writes to output/drafts/ — nothing is sent until `approve` command.
-        drafts = draft_service.save_drafts(jd, student_brief, teacher_reco)
+        # ── STEP 7: Agent 4 — Skill Upgrade Analysis ─────────────────────────
+        # Compares JD requirements vs AIML curriculum → prioritised upgrade plan
+        # RAG context highlights skills that recur across similar JDs (critical gaps)
+        with console.status("Agent 4 (skill_upgrade_agent): analysing skill gaps..."):
+            skill_upgrade = skill_upgrade_agent.run(jd, rag_context=rag_context)
 
-        # ── STEP 8: Send (only if not dry run) ───────────────────────────────
+        # ── STEP 8: Agent 5 — Application Reminder + Deadline Plan ──────────
+        # Generates deadline-aware day-by-day prep plan (7/14/30-day adaptive)
+        with console.status("Agent 5 (reminder_agent): building deadline prep plan..."):
+            reminder = reminder_agent.run(jd)
+
+        # ── STEP 9: Save draft emails ─────────────────────────────────────────
+        drafts = draft_service.save_drafts(
+            jd, student_brief, teacher_reco,
+            skill_upgrade=skill_upgrade,
+            reminder=reminder,
+        )
+
+        # ── STEP 10: Send (only if not dry run) ──────────────────────────────
         if not dry_run:
             for draft in drafts:
                 draft_service.send_approved_draft(draft["path"])
