@@ -42,18 +42,27 @@ LLM_MODEL: str    = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
 
 # ── LangSmith (monitoring + tracing) ─────────────────────────────────────────
-# LangChain reads these env vars automatically when any chain is invoked.
-# Setting them here (from .env) ensures they're loaded before first use.
-LANGCHAIN_API_KEY:      str = os.getenv("LANGCHAIN_API_KEY", "")
-LANGCHAIN_TRACING_V2:   str = os.getenv("LANGCHAIN_TRACING_V2", "false")
-LANGCHAIN_PROJECT:      str = os.getenv("LANGCHAIN_PROJECT", "pod-jd-intelligence")
-LANGCHAIN_ENDPOINT:     str = os.getenv("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com")
+# Supports both key naming conventions:
+#   LANGSMITH_*       — new convention (used in .env)
+#   LANGCHAIN_*       — old convention (still accepted by LangChain SDK)
+_ls_api_key  = os.getenv("LANGSMITH_API_KEY")  or os.getenv("LANGCHAIN_API_KEY",  "")
+_ls_tracing  = os.getenv("LANGSMITH_TRACING")  or os.getenv("LANGCHAIN_TRACING_V2", "false")
+_ls_project  = os.getenv("LANGSMITH_PROJECT")  or os.getenv("LANGCHAIN_PROJECT",  "pod-jd-intelligence")
+_ls_endpoint = os.getenv("LANGSMITH_ENDPOINT") or os.getenv("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com")
 
-# Push LangSmith settings into os.environ so LangChain SDK picks them up
-os.environ["LANGCHAIN_API_KEY"]    = LANGCHAIN_API_KEY
-os.environ["LANGCHAIN_TRACING_V2"] = LANGCHAIN_TRACING_V2
-os.environ["LANGCHAIN_PROJECT"]    = LANGCHAIN_PROJECT
-os.environ["LANGCHAIN_ENDPOINT"]   = LANGCHAIN_ENDPOINT
+# Expose as canonical names (used elsewhere in this project)
+LANGCHAIN_API_KEY:    str = _ls_api_key
+LANGCHAIN_TRACING_V2: str = _ls_tracing
+LANGCHAIN_PROJECT:    str = _ls_project
+LANGCHAIN_ENDPOINT:   str = _ls_endpoint
+
+# Push both naming conventions into os.environ so LangChain SDK picks them up
+os.environ["LANGSMITH_API_KEY"]    = _ls_api_key
+os.environ["LANGSMITH_TRACING"]    = _ls_tracing
+os.environ["LANGCHAIN_API_KEY"]    = _ls_api_key
+os.environ["LANGCHAIN_TRACING_V2"] = _ls_tracing
+os.environ["LANGCHAIN_PROJECT"]    = _ls_project
+os.environ["LANGCHAIN_ENDPOINT"]   = _ls_endpoint
 
 
 # ── Email — IMAP (read) ───────────────────────────────────────────────────────

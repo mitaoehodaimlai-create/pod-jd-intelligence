@@ -235,6 +235,6 @@ def get_status() -> str:
 if __name__ == "__main__":
     print("POD-JD MCP Server running...")
     print(f"  Model     : {config.LLM_MODEL}")
-    print(f"  LangSmith : {'ON — ' + config.LANGCHAIN_PROJECT if config.LANGCHAIN_TRACING_V2 == 'true' else 'off'}")
+    print(f"  LangSmith : {'ON — ' + config.LANGCHAIN_PROJECT if config.LANGCHAIN_TRACING_V2.lower() == 'true' else 'off'}")
     print("Waiting for Claude Code tool calls (stdio)...\n")
     mcp.run()
