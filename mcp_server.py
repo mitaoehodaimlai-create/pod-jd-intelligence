@@ -1,169 +1,231 @@
 """
-FastMCP server — exposes the POD-JD Intelligence pipeline as Claude Code tools.
+MCP SERVER — POD-JD Intelligence
+==================================
+This file turns the pipeline into a set of TOOLS that Claude Code can call
+directly from the chat, without needing a terminal.
 
-Run:
+What is MCP?
+  MCP (Model Context Protocol) lets AI assistants like Claude Code call
+  external tools and functions. Think of it as a plugin system.
+
+Tools exposed by this server:
+  1. run_pipeline(dry_run)     → run the full pipeline on new POD emails
+  2. list_jds()                → see all Job Descriptions that were parsed
+  3. list_drafts()             → see draft emails waiting for approval
+  4. approve_draft(path)       → send one approved draft via SMTP
+  5. get_status()              → summary of pipeline stats
+
+HOW TO SET UP (one-time):
+  1. Make sure the server runs: python mcp_server.py
+  2. Add to ~/.claude/mcp_servers.json:
+
+     {
+       "mcpServers": {
+         "pod-jd": {
+           "command": "python",
+           "args": ["/full/path/to/pod_jd_intelligence/mcp_server.py"],
+           "env": { "PYTHONPATH": "/full/path/to/pod_jd_intelligence" }
+         }
+       }
+     }
+
+  3. Restart Claude Code — the tools will appear automatically.
+
+RUN:
   python mcp_server.py
-
-Then add to .claude/mcp_servers.json:
-  {
-    "pod-jd": {
-      "command": "python",
-      "args": ["/path/to/pod_jd_intelligence/mcp_server.py"],
-      "env": { "PYTHONPATH": "/path/to/pod_jd_intelligence" }
-    }
-  }
 """
-from __future__ import annotations
 
 import json
 import sys
 from pathlib import Path
 
+# Add project root to Python path so all imports work
 sys.path.insert(0, str(Path(__file__).parent))
 
 from mcp.server.fastmcp import FastMCP
-import config
-from tools.email_reader import fetch_pod_emails
-from workflow.graph import process_email
-from workflow.nodes.notify import approve_and_send
 
+import config
+from services import draft_service
+
+# Create the MCP server with a name Claude Code will display
 mcp = FastMCP("pod-jd-intelligence")
 
+
+# ------------------------------------------------------------------
+# TOOL 1 — Run the pipeline
+# ------------------------------------------------------------------
 
 @mcp.tool()
 def run_pipeline(dry_run: bool = True) -> str:
     """
-    Fetch unread POD emails, parse JDs, generate student prep + faculty
-    curriculum briefs, and save email drafts locally.
+    Fetch new POD placement emails, run all three AI agents, and save
+    email drafts for students and faculty.
 
     Args:
-        dry_run: When True (default) drafts are saved but NOT sent.
-                 Set False to dispatch immediately via SMTP.
+        dry_run: True  = save drafts locally, do NOT send (default — safe)
+                 False = process + send emails immediately
 
     Returns:
-        JSON summary of processed JDs and draft file paths.
+        JSON summary of all processed JDs and their draft file paths.
     """
-    emails = fetch_pod_emails(mark_seen=False)
-    if not emails:
+    # Import here to avoid circular imports at module load time
+    from agents import email_agent, student_agent, teacher_agent
+    from services.draft_service import save_drafts
+    from main import _save_jd
+
+    # Step 1: Email Agent reads the inbox
+    jd_list = email_agent.run()
+
+    if not jd_list:
         return json.dumps({"status": "no_new_emails", "processed": []})
 
     summary = []
-    for email in emails:
-        result = process_email(email, dry_run=dry_run)
-        jd = result.get("jd") or {}
-        summary.append(
-            {
-                "email_uid": email.uid,
-                "company": jd.get("company", "?"),
-                "role": jd.get("role", "?"),
-                "error": result.get("error"),
-                "drafts": [
-                    {"draft_id": d["draft_id"], "recipient": d["recipient"], "path": d["path"]}
-                    for d in result.get("drafts", [])
-                ],
-            }
-        )
 
-    return json.dumps({"status": "ok", "dry_run": dry_run, "processed": summary}, indent=2)
+    for jd in jd_list:
+        # Step 2: Student Agent
+        student_brief = student_agent.run(jd)
 
+        # Step 3: Teacher Agent
+        teacher_reco = teacher_agent.run(jd)
+
+        # Step 4: Save JD + drafts
+        jd_path = _save_jd(jd)
+        drafts  = save_drafts(jd, student_brief, teacher_reco)
+
+        # Step 5: Send immediately if not dry run
+        if not dry_run:
+            for draft in drafts:
+                draft_service.send_approved_draft(draft["path"])
+
+        summary.append({
+            "company":  jd.get("company"),
+            "role":     jd.get("role"),
+            "jd_path":  jd_path,
+            "drafts":   drafts,
+        })
+
+    return json.dumps({
+        "status":    "ok",
+        "dry_run":   dry_run,
+        "processed": summary
+    }, indent=2)
+
+
+# ------------------------------------------------------------------
+# TOOL 2 — List all parsed JDs
+# ------------------------------------------------------------------
 
 @mcp.tool()
-def list_processed_jds() -> str:
+def list_jds() -> str:
     """
-    List all previously parsed JD JSON files in output/jds/.
+    Return a list of all Job Descriptions that have been parsed so far.
 
     Returns:
-        JSON array of {filename, company, role, deadline, path}.
+        JSON array with company, role, skills, deadline for each JD.
     """
-    jd_files = sorted(config.OUTPUT_JDS.glob("*.json"))
+    files = sorted(config.OUTPUT_JDS.glob("*.json"))
     results = []
-    for f in jd_files:
+
+    for f in files:
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-            results.append(
-                {
-                    "filename": f.name,
-                    "company": data.get("company", "?"),
-                    "role": data.get("role", "?"),
-                    "deadline": data.get("deadline", "?"),
-                    "path": str(f),
-                }
-            )
+            results.append({
+                "file":             f.name,
+                "company":          data.get("company"),
+                "role":             data.get("role"),
+                "deadline":         data.get("deadline"),
+                "required_skills":  data.get("required_skills", []),
+            })
         except Exception:
             pass
+
     return json.dumps(results, indent=2)
 
 
+# ------------------------------------------------------------------
+# TOOL 3 — List pending drafts
+# ------------------------------------------------------------------
+
 @mcp.tool()
-def list_pending_drafts() -> str:
+def list_drafts(pending_only: bool = True) -> str:
     """
-    List draft emails that have not yet been sent (sent=false).
+    Return a list of saved draft emails.
+
+    Args:
+        pending_only: True  = show only drafts NOT yet sent (default)
+                      False = show all drafts including already sent ones
 
     Returns:
-        JSON array of {draft_id, recipient, subject, sent, path}.
+        JSON array with draft_id, recipient, subject, sent status, file path.
     """
-    draft_files = sorted(config.OUTPUT_DRAFTS.glob("*.json"))
-    pending = []
-    for f in draft_files:
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-            if not data.get("sent", False):
-                pending.append(
-                    {
-                        "draft_id": data["draft_id"],
-                        "recipient": data["to"],
-                        "subject": data["subject"],
-                        "sent": False,
-                        "path": str(f),
-                    }
-                )
-        except Exception:
-            pass
-    return json.dumps(pending, indent=2)
+    drafts = draft_service.list_all_drafts(pending_only=pending_only)
+    return json.dumps(drafts, indent=2)
 
+
+# ------------------------------------------------------------------
+# TOOL 4 — Approve and send a draft
+# ------------------------------------------------------------------
 
 @mcp.tool()
 def approve_draft(draft_path: str) -> str:
     """
     Send an approved draft email via SMTP.
+    This is the only way emails get sent — nothing is auto-sent.
 
     Args:
-        draft_path: Full path to the draft JSON file (from list_pending_drafts).
+        draft_path: Full file path to the draft JSON file.
+                    Get this from list_drafts() → "path" field.
 
     Returns:
-        JSON with {success, draft_path}.
+        JSON with success status and the file path.
     """
-    ok = approve_and_send(draft_path)
-    return json.dumps({"success": ok, "draft_path": draft_path})
+    ok = draft_service.send_approved_draft(draft_path)
+    return json.dumps({
+        "success":    ok,
+        "draft_path": draft_path,
+        "message":    "Email sent successfully." if ok else "Send failed — check SMTP config in .env"
+    })
 
+
+# ------------------------------------------------------------------
+# TOOL 5 — Pipeline status
+# ------------------------------------------------------------------
 
 @mcp.tool()
-def get_pipeline_status() -> str:
+def get_status() -> str:
     """
-    Return a quick status summary: counts of JDs processed and drafts pending.
+    Return a summary of the pipeline: how many JDs processed,
+    how many drafts are pending, and current config settings.
 
     Returns:
-        JSON with counts and config info.
+        JSON object with all stats and config info.
     """
-    jd_count = len(list(config.OUTPUT_JDS.glob("*.json")))
     all_drafts = list(config.OUTPUT_DRAFTS.glob("*.json"))
-    sent = sum(
+    sent_count = sum(
         1 for f in all_drafts
         if json.loads(f.read_text(encoding="utf-8")).get("sent", False)
     )
-    return json.dumps(
-        {
-            "jds_processed": jd_count,
-            "drafts_total": len(all_drafts),
-            "drafts_sent": sent,
-            "drafts_pending": len(all_drafts) - sent,
-            "dry_run_default": config.DRY_RUN,
-            "pod_senders": list(config.POD_ALLOWED_SENDERS),
-            "llm_model": config.LLM_MODEL,
-        },
-        indent=2,
-    )
 
+    return json.dumps({
+        "jds_processed":    len(list(config.OUTPUT_JDS.glob("*.json"))),
+        "drafts_total":     len(all_drafts),
+        "drafts_sent":      sent_count,
+        "drafts_pending":   len(all_drafts) - sent_count,
+        "llm_model":        config.LLM_MODEL,
+        "dry_run_default":  config.DRY_RUN,
+        "pod_senders":      list(config.POD_ALLOWED_SENDERS),
+        "student_email":    config.STUDENT_LIST_EMAIL,
+        "faculty_email":    config.FACULTY_LIST_EMAIL,
+    }, indent=2)
+
+
+# ------------------------------------------------------------------
+# START SERVER
+# ------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # mcp.run() starts the stdio MCP server.
+    # It will wait silently for tool calls from Claude Code.
+    # This is normal — it is not frozen or hanging.
+    print("POD-JD MCP Server running. Waiting for Claude Code tool calls...")
     mcp.run()
