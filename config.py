@@ -26,9 +26,14 @@ BASE_DIR      = Path(__file__).parent
 OUTPUT_JDS    = BASE_DIR / "output" / "jds"      # parsed JD JSON files go here
 OUTPUT_DRAFTS = BASE_DIR / "output" / "drafts"   # draft email JSON files go here
 
+# RAG vector database — ChromaDB stores JD embeddings here.
+# Persists across runs so historical JDs are always available as context.
+RAG_DB_PATH   = BASE_DIR / "output" / "rag_db"
+
 # Create them if they don't exist yet
 OUTPUT_JDS.mkdir(parents=True, exist_ok=True)
 OUTPUT_DRAFTS.mkdir(parents=True, exist_ok=True)
+RAG_DB_PATH.mkdir(parents=True, exist_ok=True)
 
 
 # ── Groq LLM ─────────────────────────────────────────────────────────────────

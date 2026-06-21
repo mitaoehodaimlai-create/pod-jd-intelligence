@@ -2,26 +2,59 @@
 AGENT 2 — STUDENT AGENT
 ========================
 Generates an interview preparation guide for students using a
-LangChain + ChatGroq chain.
+LangChain + ChatGroq chain with optional RAG context.
 
-Libraries used:
-  langchain-groq  → ChatGroq LLM
-  langchain-core  → ChatPromptTemplate (builds the prompt), StrOutputParser
-  langsmith       → @traceable (traces this agent in LangSmith dashboard)
+────────────────────────────────────────────────────────────────────────────
+LLM USAGE — WHAT THIS AGENT DOES
+────────────────────────────────────────────────────────────────────────────
 
-LangSmith tracing:
-  Every call to run() is recorded as a separate trace in LangSmith.
-  You can compare briefs across different JDs in the dashboard.
+  Input  : JD dict (from email_agent) + optional RAG context (from rag/store.py)
+  Output : Markdown string — a 7-section interview prep guide
 
-Output format:
-  Returns a Markdown string with these sections:
-    1. Company & Role Overview
-    2. Must-Know Topics
-    3. Skill Gaps vs B.Tech AIML Curriculum
-    4. 2-Week Prep Plan
-    5. Practice Resources
-    6. 10 Likely Interview Questions
-    7. Projects to Showcase
+  LangChain chain:
+
+    STUDENT_PREP_PROMPT  ← fills {jd_content} with JD JSON + RAG context,
+                           formats as a chat message list
+           ↓
+    ChatGroq             ← sends to Groq API, gets the prep guide back
+           ↓
+    StrOutputParser      ← extracts the plain text from AIMessage.content
+
+  temperature=0.4 → allows some creativity for natural-sounding guidance
+  (slightly higher than the JD parser's 0.1 — recommendations benefit from
+  varied, non-robotic language)
+
+────────────────────────────────────────────────────────────────────────────
+RAG USAGE — HOW HISTORICAL CONTEXT IMPROVES OUTPUT
+────────────────────────────────────────────────────────────────────────────
+
+  The rag_context parameter is a formatted string like:
+
+    "[3 SIMILAR PAST JDs FROM THIS SEMESTER FOR CONTEXT]
+     Past JD #1: TCS | Backend Dev | Python, Java, SQL
+     Past JD #2: Infosys | SDE | Python, REST, DSA
+     Past JD #3: Wipro | Data Engineer | Python, Spark, SQL"
+
+  WHY IT MATTERS:
+    Without RAG: AI gives a good generic prep guide for THIS JD alone.
+    With RAG:    AI notices Python + SQL appear across all 3 similar JDs and
+                 says "Python and SQL are the #1 priorities this semester —
+                 even if you already know basics, go deeper."
+                 It can also note: "DSA appeared in 2/3 similar roles — allocate
+                 extra prep time even though this JD doesn't list it explicitly."
+
+  The LLM prompt instructs the model to use this context for pattern analysis.
+  If rag_context is empty (no similar JDs yet), the agent works exactly as before.
+
+────────────────────────────────────────────────────────────────────────────
+LANGSMITH TRACING
+────────────────────────────────────────────────────────────────────────────
+
+  @traceable records every run() call with:
+    - Full prompt (including RAG context if present)
+    - Full generated brief
+    - Latency and token counts
+  Compare student briefs for different JDs side-by-side in LangSmith.
 """
 
 import json
@@ -34,12 +67,13 @@ from langsmith import traceable
 import config
 
 
-# ── LLM SETUP ────────────────────────────────────────────────────────────────
+# ── LLM CONFIGURATION ────────────────────────────────────────────────────────
 
-def _get_llm():
+def _get_llm() -> ChatGroq:
     """
-    Create and return a ChatGroq LLM instance for student brief generation.
-    temperature=0.4 → slightly creative, produces natural-sounding guidance.
+    ChatGroq for student brief generation.
+    temperature=0.4 → slightly creative, produces natural-sounding guidance
+    (not too random, not robotically repetitive).
     """
     return ChatGroq(
         model       = config.LLM_MODEL,
@@ -49,6 +83,8 @@ def _get_llm():
 
 
 # ── PROMPT TEMPLATE ───────────────────────────────────────────────────────────
+# {jd_content} is filled at runtime with: JD JSON + optional RAG context.
+# The system message tells the LLM WHO it is and WHAT structure to follow.
 
 STUDENT_PREP_PROMPT = ChatPromptTemplate.from_messages([
     (
@@ -58,6 +94,11 @@ for B.Tech students in the Computer Science (AI & ML) program.
 
 A campus placement opportunity has arrived. Based on the Job Description,
 write a complete, actionable interview preparation guide in Markdown.
+
+If historical context from similar past JDs is provided, use it to:
+  - Emphasize skills that appear repeatedly across similar roles
+  - Note any skill gaps that keep appearing (signal to prepare harder)
+  - Tailor the prep plan based on what this type of company typically expects
 
 Include EXACTLY these sections:
 
@@ -90,44 +131,63 @@ Rules:
 - Keep language simple, practical, motivating
 - Everything must be specific to THIS JD — no generic advice""",
     ),
-    ("human", "Job Description:\n{jd_json}"),
+    # {jd_content} = "Job Description: ...\n\n[historical context if available]"
+    ("human", "{jd_content}"),
 ])
 
 
 # ── PUBLIC FUNCTION ───────────────────────────────────────────────────────────
 
 @traceable(name="student-agent", run_type="chain")
-def run(jd: dict) -> str:
+def run(jd: dict, rag_context: str = "") -> str:
     """
-    Generate a student interview prep brief for the given Job Description.
+    Generate a student interview prep brief for the given JD.
 
-    Uses a LangChain chain:
-      Prompt template → ChatGroq LLM → StrOutputParser (plain text output)
+    ── LangChain CHAIN STEPS ─────────────────────────────────────────────────
+      1. STUDENT_PREP_PROMPT: fills {jd_content} → returns [SystemMsg, HumanMsg]
+      2. ChatGroq:            calls Groq API → returns AIMessage with Markdown text
+      3. StrOutputParser:     extracts plain text string from AIMessage.content
 
-    LangSmith traces this entire run, including the prompt sent and
-    the response received from Groq.
+      chain = STUDENT_PREP_PROMPT | _get_llm() | StrOutputParser()
+      brief = chain.invoke({"jd_content": jd_content})
+
+    ── RAG AUGMENTATION ──────────────────────────────────────────────────────
+      rag_context (passed from main.py) contains similar past JDs from ChromaDB.
+      When present, it is appended to the user message so the LLM can:
+        - Spot recurring skill requirements across similar roles
+        - Mention patterns like "Python is in every similar JD — top priority"
+        - Adjust the prep plan weight based on historical frequency
 
     Args:
-        jd: parsed JD dict from email_agent (company, role, skills, etc.)
+        jd:          parsed JD dict from email_agent
+        rag_context: formatted string from rag_store.format_rag_context()
+                     (empty string = no RAG, agent still works fine)
 
     Returns:
-        Markdown string with the full prep guide,
-        or "" if the API call failed.
+        Markdown string with the full prep guide.
+        Returns "" on LLM/API error (non-fatal).
     """
     print("\n=== STUDENT AGENT: Generating prep brief ===")
     print(f"    Company : {jd.get('company')}  |  Role : {jd.get('role')}")
+    if rag_context:
+        print(f"    RAG     : historical context added to prompt")
 
     try:
-        # LangChain chain: prompt → LLM → plain text parser
-        # LangSmith traces each step automatically.
+        # Build the user message.
+        # Plain JD JSON is always included.
+        # rag_context is appended when available (the "Augmented" part of RAG).
+        jd_content = f"Job Description:\n{json.dumps(jd, indent=2)}"
+        if rag_context:
+            jd_content += f"\n\n{rag_context}"
+
+        # LangChain chain: PROMPT | LLM | PARSER
+        # LangSmith traces each step automatically — prompt, response, timing.
         chain = STUDENT_PREP_PROMPT | _get_llm() | StrOutputParser()
+        brief = chain.invoke({"jd_content": jd_content})
 
-        # Pass the JD as formatted JSON so the LLM can read all fields
-        brief = chain.invoke({"jd_json": json.dumps(jd, indent=2)})
-
-        print(f"    ✓ Student brief ready ({len(brief)} characters)")
+        print(f"    ✓ Brief ready ({len(brief)} chars)")
         return brief
 
     except Exception as e:
-        print(f"    ✗ Groq/LangChain error: {e}")
+        print(f"    ✗ LLM error in student_agent.run: {e}")
         return ""

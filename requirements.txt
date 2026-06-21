@@ -1,27 +1,35 @@
-# ── LangChain + Groq (LLM calls inside agents) ───────────────────
-langchain>=0.3.0              # Core LangChain — chains, prompts, parsers
-langchain-core>=0.3.0         # Base classes (Runnable, etc.)
-langchain-groq>=0.2.0         # LangChain wrapper for Groq API
-langsmith>=0.1.120            # LLM monitoring and tracing dashboard
+# ── LangChain + Groq (LLM calls inside agents) ───────────────────────────────
+langchain>=0.3.0              # Core: chains, prompts, parsers, LCEL "|" operator
+langchain-core>=0.3.0         # Base Runnable/Sequence classes
+langchain-groq>=0.2.0         # ChatGroq wrapper (sends prompts to Groq API)
+langsmith>=0.1.120            # @traceable decorator + LangSmith dashboard
 
-# ── Groq API ─────────────────────────────────────────────────────
+# ── Groq API ─────────────────────────────────────────────────────────────────
 groq>=0.9.0                   # Groq SDK (used by langchain-groq internally)
 
-# ── FastAPI server ───────────────────────────────────────────────
-fastapi>=0.115.0              # REST API
-uvicorn[standard]>=0.30.0     # Runs the FastAPI server
+# ── RAG — Retrieval-Augmented Generation ─────────────────────────────────────
+# Stores past JDs as semantic vectors; retrieves similar ones as LLM context.
+# First run downloads the embedding model (~90MB) to ~/.cache/huggingface/
+langchain-community>=0.3.0    # LangChain wrappers for Chroma + HuggingFace
+chromadb>=0.5.0               # Local vector database (stores JD embeddings on disk)
+sentence-transformers>=3.0.0  # all-MiniLM-L6-v2 embedding model (free, CPU-only)
 
-# ── MCP server (Claude Code tool integration) ────────────────────
-mcp[cli]>=1.3.0               # FastMCP server
+# ── FastAPI server (started by `python main.py serve`) ───────────────────────
+# api.py is merged into main.py — start with: python main.py serve
+fastapi>=0.115.0              # REST API framework + auto Swagger UI at /docs
+uvicorn[standard]>=0.30.0     # ASGI server that runs FastAPI
 
-# ── Email ────────────────────────────────────────────────────────
-imap-tools>=1.7.0             # Read emails via IMAP
+# ── MCP server (Claude Code tool integration) ────────────────────────────────
+mcp[cli]>=1.3.0               # FastMCP — exposes agents as Claude Code tools
 
-# ── PDF text extraction ──────────────────────────────────────────
-pdfplumber>=0.11.0            # Primary PDF reader
+# ── Email ─────────────────────────────────────────────────────────────────────
+imap-tools>=1.7.0             # IMAP email reader (read POD inbox)
+
+# ── PDF text extraction ───────────────────────────────────────────────────────
+pdfplumber>=0.11.0            # Primary PDF reader (better table/layout handling)
 pypdf>=4.3.0                  # Fallback PDF reader
 
-# ── Utilities ────────────────────────────────────────────────────
-python-dotenv>=1.0.0          # Load .env file
-pydantic>=2.10.0              # Data validation
-rich>=13.9.0                  # Pretty terminal output
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0          # Load .env credentials at startup
+pydantic>=2.10.0              # Data validation (used by FastAPI)
+rich>=13.9.0                  # Pretty terminal output (tables, panels, colors)

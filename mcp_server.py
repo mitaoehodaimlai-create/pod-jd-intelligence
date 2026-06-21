@@ -72,6 +72,13 @@ def run_pipeline(dry_run: bool = True) -> str:
     from agents import email_agent, student_agent, teacher_agent
     from main import _save_jd
 
+    # RAG store (optional — pipeline works without it)
+    try:
+        from rag import store as rag_store
+        _rag_ok = True
+    except ImportError:
+        _rag_ok = False
+
     # Step 1: Fetch unread POD emails
     emails = get_pod_emails()
     if not emails:
@@ -99,11 +106,20 @@ def run_pipeline(dry_run: bool = True) -> str:
 
         _save_jd(jd)
 
-        # Step 5: Agent 2 — Student brief (LangChain + Groq)
-        student_brief = student_agent.run(jd)
+        # Step 4b: RAG — store JD + retrieve similar past JDs for context
+        # Stored JDs are embedded as vectors in ChromaDB and retrieved by
+        # semantic similarity so agents can spot semester-wide skill trends.
+        rag_context = ""
+        if _rag_ok:
+            rag_store.add_jd(jd)
+            similar     = rag_store.get_similar_jds(jd)
+            rag_context = rag_store.format_rag_context(similar)
 
-        # Step 6: Agent 3 — Teacher reco (LangChain + Groq)
-        teacher_reco = teacher_agent.run(jd)
+        # Step 5: Agent 2 — Student brief (LangChain + Groq + RAG context)
+        student_brief = student_agent.run(jd, rag_context=rag_context)
+
+        # Step 6: Agent 3 — Teacher reco (LangChain + Groq + RAG context)
+        teacher_reco = teacher_agent.run(jd, rag_context=rag_context)
 
         # Step 7: Save drafts
         drafts = draft_service.save_drafts(jd, student_brief, teacher_reco)

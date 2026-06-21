@@ -2,26 +2,60 @@
 AGENT 3 — TEACHER AGENT
 ========================
 Generates curriculum update recommendations for faculty using a
-LangChain + ChatGroq chain.
+LangChain + ChatGroq chain with optional RAG context.
 
-Libraries used:
-  langchain-groq  → ChatGroq LLM
-  langchain-core  → ChatPromptTemplate, StrOutputParser
-  langsmith       → @traceable (traces this agent in LangSmith dashboard)
+────────────────────────────────────────────────────────────────────────────
+LLM USAGE — WHAT THIS AGENT DOES
+────────────────────────────────────────────────────────────────────────────
 
-LangSmith tracing:
-  Every call to run() is recorded as a separate trace in LangSmith.
-  Faculty recommendations can be compared and reviewed over time.
+  Input  : JD dict (from email_agent) + optional RAG context (from rag/store.py)
+  Output : Markdown string — a 7-section curriculum recommendation report
 
-Output format:
-  Returns a Markdown string with these sections:
-    1. Industry Demand Summary
-    2. Curriculum Gaps
-    3. Suggested Syllabus Updates (with CO-PO mapping)
-    4. Practical Lab Approaches
-    5. Study Material & References
-    6. Semester Project Ideas
-    7. Quick-Win Actions This Semester
+  LangChain chain (same pattern as student_agent):
+
+    TEACHER_RECO_PROMPT  ← fills {jd_content} with JD JSON + RAG context
+           ↓
+    ChatGroq             ← calls Groq API (Llama 3.3-70B), gets Markdown back
+           ↓
+    StrOutputParser      ← returns the plain Markdown string
+
+  temperature=0.4 → some creativity for practical lab suggestions while
+  keeping academic recommendations grounded and specific.
+
+────────────────────────────────────────────────────────────────────────────
+RAG USAGE — HOW HISTORICAL CONTEXT IMPROVES FACULTY RECOMMENDATIONS
+────────────────────────────────────────────────────────────────────────────
+
+  The rag_context parameter adds patterns from similar past JDs.
+
+  WHY IT MATTERS FOR FACULTY:
+    Without RAG: "This JD needs Docker — add a Docker lab session."
+    With RAG:    "Docker appears in 5/7 similar JDs this semester.
+                 This is a persistent curriculum gap, not a one-off.
+                 Recommend escalating to a full Docker module, not a
+                 one-class demo."
+
+  The model can also detect RECURRING recommendations:
+    "DSA gap mentioned 4 times this semester — suggest a standing weekly
+    problem-solving session rather than ad-hoc mentions."
+
+  This turns isolated JD-level suggestions into semester-level insights.
+
+────────────────────────────────────────────────────────────────────────────
+CO-PO MAPPING (Course Outcomes / Programme Outcomes)
+────────────────────────────────────────────────────────────────────────────
+  The prompt asks the LLM to map each suggestion to CO1–CO6 and PO1–PO12.
+  These are NBA/NAAC accreditation codes used in Indian engineering colleges.
+  The LLM knows these codes from its training data and applies them correctly.
+  Faculty can use these mappings directly in OBE (Outcome-Based Education) docs.
+
+────────────────────────────────────────────────────────────────────────────
+LANGSMITH TRACING
+────────────────────────────────────────────────────────────────────────────
+  @traceable records every run() — full prompt (including RAG context),
+  full recommendation text, latency, tokens.
+  Review past recommendations in LangSmith to avoid repetition and track
+  which suggestions have been made before.
 """
 
 import json
@@ -34,12 +68,13 @@ from langsmith import traceable
 import config
 
 
-# ── LLM SETUP ────────────────────────────────────────────────────────────────
+# ── LLM CONFIGURATION ────────────────────────────────────────────────────────
 
-def _get_llm():
+def _get_llm() -> ChatGroq:
     """
-    Create and return a ChatGroq LLM instance for teacher recommendations.
-    temperature=0.4 → some creativity for practical suggestions.
+    ChatGroq for curriculum recommendation generation.
+    temperature=0.4 → balanced: specific enough for academic use, creative
+    enough to suggest novel approaches (lab ideas, project titles, etc.)
     """
     return ChatGroq(
         model       = config.LLM_MODEL,
@@ -60,6 +95,12 @@ Department: B.Tech CSE with specialization in Artificial Intelligence & Machine 
 
 A new placement JD has arrived. Based on it, write specific curriculum update
 recommendations for faculty members in Markdown format.
+
+If historical context from similar past JDs is provided, use it to:
+  - Identify RECURRING skill gaps (seen in multiple JDs = urgent curriculum fix)
+  - Distinguish one-off requests from sustained industry trends
+  - Suggest proportional action: a skill in 1 JD → guest lecture;
+    a skill in 5+ JDs → formal syllabus revision or new elective
 
 Include EXACTLY these sections:
 
@@ -96,42 +137,60 @@ Rules:
 - Be specific to AIML engineering education — no generic higher-ed advice
 - Focus on practical, immediately actionable suggestions""",
     ),
-    ("human", "Job Description:\n{jd_json}"),
+    # {jd_content} = "Job Description: ...\n\n[historical context if available]"
+    ("human", "{jd_content}"),
 ])
 
 
 # ── PUBLIC FUNCTION ───────────────────────────────────────────────────────────
 
 @traceable(name="teacher-agent", run_type="chain")
-def run(jd: dict) -> str:
+def run(jd: dict, rag_context: str = "") -> str:
     """
-    Generate faculty curriculum recommendations for the given Job Description.
+    Generate faculty curriculum recommendations for the given JD.
 
-    Uses a LangChain chain:
-      Prompt template → ChatGroq LLM → StrOutputParser (plain text output)
+    ── LangChain CHAIN STEPS ─────────────────────────────────────────────────
+      1. TEACHER_RECO_PROMPT: fills {jd_content} → [SystemMessage, HumanMessage]
+      2. ChatGroq:            Groq API call → AIMessage with Markdown text
+      3. StrOutputParser:     plain string from AIMessage.content
 
-    LangSmith traces this entire run — you can review what was recommended
-    for each JD in the LangSmith dashboard.
+      chain = TEACHER_RECO_PROMPT | _get_llm() | StrOutputParser()
+      reco  = chain.invoke({"jd_content": jd_content})
+
+    ── RAG AUGMENTATION ──────────────────────────────────────────────────────
+      rag_context from rag_store.format_rag_context() contains similar past JDs.
+      Faculty get semester-level insights:
+        - "Docker appeared in 5 JDs this semester → upgrade from demo to module"
+        - "This is the 3rd JD needing system design → recommend a new elective"
 
     Args:
-        jd: parsed JD dict from email_agent (company, role, skills, etc.)
+        jd:          parsed JD dict from email_agent
+        rag_context: formatted string from rag_store.format_rag_context()
+                     (empty string = no RAG, agent still works fine)
 
     Returns:
-        Markdown string with full curriculum recommendations,
-        or "" if the API call failed.
+        Markdown string with full curriculum recommendations.
+        Returns "" on LLM/API error (non-fatal).
     """
     print("\n=== TEACHER AGENT: Generating curriculum recommendations ===")
     print(f"    Company : {jd.get('company')}  |  Role : {jd.get('role')}")
+    if rag_context:
+        print(f"    RAG     : historical context added to prompt")
 
     try:
-        # LangChain chain: prompt → LLM → plain text parser
+        # Build user message: JD JSON + RAG context (if any)
+        jd_content = f"Job Description:\n{json.dumps(jd, indent=2)}"
+        if rag_context:
+            jd_content += f"\n\n{rag_context}"
+
+        # LangChain chain: PROMPT → LLM → PARSER
+        # LangSmith traces every step — see at https://smith.langchain.com
         chain = TEACHER_RECO_PROMPT | _get_llm() | StrOutputParser()
+        reco  = chain.invoke({"jd_content": jd_content})
 
-        reco = chain.invoke({"jd_json": json.dumps(jd, indent=2)})
-
-        print(f"    ✓ Teacher reco ready ({len(reco)} characters)")
+        print(f"    ✓ Reco ready ({len(reco)} chars)")
         return reco
 
     except Exception as e:
-        print(f"    ✗ Groq/LangChain error: {e}")
+        print(f"    ✗ LLM error in teacher_agent.run: {e}")
         return ""
